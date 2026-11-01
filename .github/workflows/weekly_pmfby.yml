@@ -36,7 +36,7 @@ jobs:
         run: |
           RUN_DATE=$(date +'%Y-%m-%d')
 
-          python PMFBY_Dashboard_State_Data_Download_V7.py \
+          python main.py \
             --year 2026 \
             --season Kharif \
             --scheme BOTH \
