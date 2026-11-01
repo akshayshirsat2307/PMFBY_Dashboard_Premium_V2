@@ -6,7 +6,7 @@ on:
 
   # Weekly scheduled execution
   schedule:
-    - cron: "30 3 * * 1"
+    - cron: "0 1 * * 1"
 
 permissions:
   contents: write
@@ -65,7 +65,7 @@ jobs:
             --scheme BOTH \
             --drill-to-district \
             --retries 3 \
-            --output "pmfby_2026_kharif_${RUN_DATE}.csv"
+            --output "pmfby_2026_Rabi_${RUN_DATE}.csv"
 
       # ----------------------------------------------------------
       # 7. Check generated CSV
@@ -89,16 +89,16 @@ jobs:
           name: pmfby-weekly-data
           path: data/*.csv
 
-      # ----------------------------------------------------------
-      # 9. Send email
-      # ----------------------------------------------------------
-      - name: Send PMFBY report by email
-        env:
-          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+      # # ----------------------------------------------------------
+      # # 9. Send email
+      # # ----------------------------------------------------------
+      # - name: Send PMFBY report by email
+      #   env:
+      #     SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+      #     SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
 
-        run: |
-          python mail_pmfby_dashboard.py
+      #   run: |
+      #     python mail_pmfby_dashboard.py
 
       # ----------------------------------------------------------
       # 10. Commit CSV back into repository
