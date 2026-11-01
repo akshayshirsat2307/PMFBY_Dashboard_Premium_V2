@@ -95,8 +95,7 @@ jobs:
       - name: Send PMFBY report by email
         env:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
 
         run: |
           python mail_pmfby_dashboard.py
