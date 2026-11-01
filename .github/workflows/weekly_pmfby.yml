@@ -61,7 +61,7 @@ jobs:
 
           python main.py \
             --year 2026 \
-            --season Kharif \
+            --season Rabi \
             --scheme BOTH \
             --drill-to-district \
             --retries 3 \
@@ -99,7 +99,7 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
 
         run: |
-          python send_email.py
+          python mail_pmfby_dashboard.py
 
       # ----------------------------------------------------------
       # 10. Commit CSV back into repository
