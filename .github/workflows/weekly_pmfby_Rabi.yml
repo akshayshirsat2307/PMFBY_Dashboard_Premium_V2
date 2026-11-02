@@ -89,16 +89,16 @@ jobs:
           name: pmfby-weekly-data
           path: data/*.csv
 
-      # # ----------------------------------------------------------
-      # # 9. Send email
-      # # ----------------------------------------------------------
-      # - name: Send PMFBY report by email
-      #   env:
-      #     SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-      #     SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+      # ----------------------------------------------------------
+      # 9. Send email
+      # ----------------------------------------------------------
+      - name: Send PMFBY report by email
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
 
-      #   run: |
-      #     python mail_pmfby_dashboard.py
+        run: |
+          python mail_pmfby_dashboard.py
 
       # ----------------------------------------------------------
       # 10. Commit CSV back into repository
