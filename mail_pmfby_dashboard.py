@@ -97,7 +97,7 @@ if not attachments:
 msg = EmailMessage()
 
 msg["Subject"] = (
-    f"PMFBY Weekly Rabi District Data - "
+    f"PMFBY Premium Weekly Rabi District Data - "
     f"{date_display}"
 )
 
