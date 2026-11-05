@@ -1,534 +1,438 @@
-# python .\PMFBY_Dashboard_State_Data_Download_V5.py
-
-# It defaults to:
-
-# Year: 2026
-# Season: Kharif
-# Scheme: PMFBY + WBCIS
-# States: All available
-# Level: District
-# Output: one consolidated CSV in data
-
-# python .\PMFBY_Dashboard_State_Data_Download_V7.py --output all_states.csv
-# python .\PMFBY_Dashboard_State_Data_Download_V7.py --year 2026 --season Kharif --scheme PMFBY --drill-to-district --output all_states.csv
-# python .\PMFBY_Dashboard_State_Data_Download_V7.py --year 2026 --season Kharif --scheme BOTH --drill-to-district --output all_states.csv
+## This is working code for PMFBY Premium Calculator
 
 
-import argparse
+from __future__ import annotations
+
 import csv
-import os
 import re
 import time
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+import traceback
+from pathlib import Path
+from typing import Optional
 
-from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    TimeoutException,
-    WebDriverException,
-)
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select, WebDriverWait
+from playwright.sync_api import Browser, BrowserContext, Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-DASHBOARD_URL = "https://pmfby.gov.in/adminStatistics/dashboard"
-WAIT_SECONDS = 30
-MAX_STATE_RETRIES = 3
-RETRY_WAIT_SECONDS = 3
+HOME_URL = "https://pmfby.gov.in/"
+SEASON = "Kharif"  # Kharif / Rabi
+YEAR = "2026" # Rabi then 2026-2027
+SCHEME = "Weather Based Crop Insurance Scheme" # Weather Based Crop Insurance Scheme / Pradhan Mantri Fasal Bima Yojana
+SCHEME1 = "WBCIS" # WBCIS / PMFBY
+STATE = "ANDHRA PRADESH"  # "ANDHRA PRADESH", "ANDAMAN & NICOBAR ISLANDS"
+AREA_HECTARE = "1"
+HEADLESS = False
+REPROCESS_EXISTING = False
+MAX_ATTEMPTS = 3
+DEFAULT_TIMEOUT_MS = 30000
+NAVIGATION_TIMEOUT_MS = 60000
+RESULT_TIMEOUT_MS = 45000
+OUTPUT_DIR = Path("pmfby_output1")
+OUTPUT_CSV = OUTPUT_DIR / f"Premium_Rate_{STATE.lower().replace(' ', '_')}_{SEASON.lower()}_{YEAR}_{SCHEME1}.csv"
+FAILURE_CSV = OUTPUT_DIR / f"Premium_Rate_{STATE.lower().replace(' ', '_')}_{SEASON.lower()}_{YEAR}_{SCHEME1}_failures.csv"
 
-SELECTORS = {
-    "state_wise_report_link": '//a[@title="State Wise Report"]',
-    "year_dropdown": '//label[normalize-space()="Year"]/following-sibling::select',
-    "season_dropdown": '//label[normalize-space()="Season"]/following-sibling::select',
-    "scheme_dropdown": '//label[normalize-space()="Scheme"]/following-sibling::select',
-    "results_table": "table.adminStatics__dashboardTableDT___1cEkH",
-}
-
-SEASON_CODES = {"Kharif": "01", "Rabi": "02"}
-SCHEME_CODES = {"PMFBY": "04", "WBCIS": "02"}
-
-
-@dataclass
-class FilterSpec:
-    year: str
-    season: str
-    scheme: str
-    state: Optional[str] = None
+OUTPUT_COLUMNS = [
+    "season", "year", "scheme", "state", "district", "crop", "area_hectare",
+    "insurance_company", "sum_insured_rs_per_hectare", "farmer_share_percent",
+    "actuarial_rate_percent", "cutoff_date_actual", "premium_paid_by_farmer_rs",
+    "premium_paid_by_government_rs", "sum_insured_rs", "cutoff_date_csc",
+    "cutoff_date_aide", "data_entry_date_bank", "premium_debit_date_bank",
+    "challan_date_bank", "scraped_at", "status", "remarks"
+]
+FAILURE_COLUMNS = ["season", "year", "scheme", "state", "district", "crop", "attempt", "error", "failed_at"]
 
 
-def sanitize_filename_part(text: str) -> str:
-    text = str(text).strip().replace(" ", "_")
-    return re.sub(r"[^A-Za-z0-9_-]", "", text)
+def clean_text(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def get_data_folder() -> str:
-    """Create and return a data folder beside this Python script."""
-    script_folder = os.path.dirname(os.path.abspath(__file__))
-    data_folder = os.path.join(script_folder, "data")
-    os.makedirs(data_folder, exist_ok=True)
-    return data_folder
+def normalize(value: str) -> str:
+    value = clean_text(value).lower().replace("₹", " rs ").replace("%", " percent ")
+    return clean_text(re.sub(r"[^a-z0-9]+", " ", value))
 
 
-def build_default_output(year: str, season: str, scheme: str) -> str:
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = (
-        f"pmfby_district_data_{sanitize_filename_part(year)}_"
-        f"{sanitize_filename_part(season)}_{sanitize_filename_part(scheme)}_"
-        f"{timestamp}.csv"
-    )
-    return os.path.join(get_data_folder(), filename)
+def timestamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def build_csv_filename(spec: FilterSpec) -> str:
-    parts = ["pmfby"]
-    if spec.state:
-        parts.append(sanitize_filename_part(spec.state))
-    parts.extend(
-        [
-            sanitize_filename_part(spec.year),
-            sanitize_filename_part(spec.season),
-            sanitize_filename_part(spec.scheme),
-        ]
-    )
-    return os.path.join(get_data_folder(), "_".join(parts) + ".csv")
+def append_csv(path: Path, row: dict, columns: list[str]) -> None:
+    exists = path.exists() and path.stat().st_size > 0
+    with path.open("a", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        writer.writerow({column: row.get(column, "") for column in columns})
 
 
-def resolve_output_path(output: Optional[str], year: str, season: str, scheme: str) -> str:
-    if not output:
-        return build_default_output(year, season, scheme)
-    if os.path.dirname(output):
-        path = os.path.abspath(output)
-    else:
-        path = os.path.join(get_data_folder(), output)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    return path
+def completed_pairs() -> set[tuple[str, str]]:
+    done: set[tuple[str, str]] = set()
+    if REPROCESS_EXISTING or not OUTPUT_CSV.exists():
+        return done
+    with OUTPUT_CSV.open("r", newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            if clean_text(row.get("status")).lower() == "success":
+                done.add((clean_text(row.get("district")).casefold(), clean_text(row.get("crop")).casefold()))
+    return done
 
 
-def make_driver(headless: bool = True):
-    from selenium.webdriver.chrome.options import Options
-
-    options = Options()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1400,1000")
-    options.add_argument("--log-level=3")
-
-    driver = webdriver.Chrome(options=options)
-    driver.implicitly_wait(3)
-    driver.set_page_load_timeout(60)
-    return driver
-
-
-def _is_xpath(selector: str) -> bool:
-    return selector.startswith("//") or selector.startswith("(")
-
-
-def wait_visible(driver, selector: str, timeout: int = WAIT_SECONDS):
-    by = By.XPATH if _is_xpath(selector) else By.CSS_SELECTOR
-    return WebDriverWait(driver, timeout).until(
-        EC.visibility_of_element_located((by, selector))
-    )
-
-
-def wait_clickable(driver, selector: str, timeout: int = WAIT_SECONDS):
-    by = By.XPATH if _is_xpath(selector) else By.CSS_SELECTOR
-    return WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((by, selector))
-    )
-
-
-def wait_for_table_rows(driver, timeout: int = WAIT_SECONDS):
-    return WebDriverWait(driver, timeout).until(
-        lambda d: d.find_element(By.CSS_SELECTOR, SELECTORS["results_table"])
-        if d.find_elements(By.CSS_SELECTOR, SELECTORS["results_table"] + " tbody tr")
-        else False
-    )
-
-
-def select_dropdown_by_value(driver, selector: str, value: str):
-    element = wait_visible(driver, selector)
-    Select(element).select_by_value(value)
-    time.sleep(1.5)
-
-
-def click_row_link_by_title(driver, name: str):
-    table = wait_for_table_rows(driver)
-    old_html = table.get_attribute("innerHTML")
-
-    element = WebDriverWait(driver, WAIT_SECONDS).until(
-        lambda d: d.execute_script(
-            """
-            const table = document.querySelector(arguments[0]);
-            if (!table) return null;
-            return Array.from(table.querySelectorAll('tbody a[title]')).find(
-                a => (a.getAttribute('title') || '').trim() === arguments[1]
-            ) || null;
-            """,
-            SELECTORS["results_table"],
-            name,
-        )
-    )
-
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-    try:
-        element.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", element)
-
-    WebDriverWait(driver, WAIT_SECONDS).until(
-        lambda d: d.find_element(
-            By.CSS_SELECTOR, SELECTORS["results_table"]
-        ).get_attribute("innerHTML")
-        != old_html
-    )
-    wait_for_table_rows(driver)
-    time.sleep(1)
-
-
-def navigate_to(driver, spec: FilterSpec):
-    driver.get(DASHBOARD_URL)
-    WebDriverWait(driver, WAIT_SECONDS).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
-
-    report_link = wait_clickable(driver, SELECTORS["state_wise_report_link"])
-    try:
-        report_link.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", report_link)
-    time.sleep(2)
-
-    select_dropdown_by_value(driver, SELECTORS["year_dropdown"], spec.year)
-    select_dropdown_by_value(
-        driver, SELECTORS["season_dropdown"], SEASON_CODES[spec.season]
-    )
-    select_dropdown_by_value(
-        driver, SELECTORS["scheme_dropdown"], SCHEME_CODES[spec.scheme]
-    )
-    wait_for_table_rows(driver)
-
-    if spec.state:
-        click_row_link_by_title(driver, spec.state)
-
-
-def extract_table_rows(driver) -> Tuple[List[str], List[List[str]]]:
-    try:
-        table_element = wait_for_table_rows(driver)
-    except TimeoutException:
-        return [], []
-
-    soup = BeautifulSoup(table_element.get_attribute("outerHTML"), "html.parser")
-    headers = [th.get_text(" ", strip=True) for th in soup.select("thead th")]
-
-    rows: List[List[str]] = []
-    for tr in soup.select("tbody tr"):
-        values: List[str] = []
-        for td in tr.find_all("td"):
-            anchor = td.find("a")
-            if anchor and anchor.get("title"):
-                values.append(anchor.get("title").strip())
-            else:
-                values.append(td.get_text(" ", strip=True))
-        if values:
-            rows.append(values)
-    return headers, rows
-
-
-def row_names(driver) -> List[str]:
-    """Return only real clickable state names, excluding numeric totals."""
-    table = wait_for_table_rows(driver)
-    links = table.find_elements(By.CSS_SELECTOR, "tbody a[title]")
-
-    states: List[str] = []
-    for link in links:
-        name = (link.get_attribute("title") or "").strip()
-        if name and any(character.isalpha() for character in name) and name not in states:
-            states.append(name)
-    return states
-
-
-def drop_grand_total(
-    headers: List[str], rows: List[List[str]]
-) -> Tuple[List[str], List[List[str]]]:
-    filtered = [
-        row
-        for row in rows
-        if not any(str(cell).strip().lower() == "grand total" for cell in row)
-    ]
-    return headers, filtered
-
-
-def append_rows(
-    spec: FilterSpec,
-    headers: List[str],
-    rows: List[List[str]],
-    csv_path: str,
-):
-    if not rows:
-        return
-
-    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-    meta_headers = ["Year", "Season", "Scheme", "State (selected)"]
-    meta_values = [spec.year, spec.season, spec.scheme, spec.state or ""]
-    max_columns = max(len(row) for row in rows)
-    data_headers = (
-        headers
-        if len(headers) == max_columns
-        else [f"Col{i + 1}" for i in range(max_columns)]
-    )
-
-    file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
-    with open(csv_path, "a", newline="", encoding="utf-8-sig") as file:
-        writer = csv.writer(file)
-        if not file_exists:
-            writer.writerow(meta_headers + data_headers)
-        for row in rows:
-            padded_row = row + [""] * (max_columns - len(row))
-            writer.writerow(meta_values + padded_row)
-
-
-def validate_district_rows(state: str, rows: List[List[str]]):
-    if not rows:
-        raise RuntimeError(f"No district rows returned for {state}")
-    if len(rows) == 1 and any(str(value).strip() == state for value in rows[0]):
-        raise RuntimeError(f"Dashboard did not drill down into {state}")
-
-
-def download_state_with_retry(
-    driver,
-    state_spec: FilterSpec,
-    csv_path: str,
-    max_retries: int = MAX_STATE_RETRIES,
-) -> Tuple[bool, int, str]:
-    last_error = ""
-
-    for attempt in range(1, max_retries + 1):
+def first_visible(locator: Locator) -> Optional[Locator]:
+    for index in range(locator.count()):
+        item = locator.nth(index)
         try:
-            navigate_to(driver, state_spec)
-            headers, rows = extract_table_rows(driver)
-            headers, rows = drop_grand_total(headers, rows)
-            validate_district_rows(state_spec.state or "", rows)
-            append_rows(state_spec, headers, rows, csv_path)
-            return True, len(rows), ""
-        except (
-            TimeoutException,
-            NoSuchElementException,
-            WebDriverException,
-            RuntimeError,
-        ) as error:
-            last_error = f"{type(error).__name__}: {str(error).strip() or 'dashboard timeout'}"
-            if attempt < max_retries:
-                print(
-                    f"  [{state_spec.scheme}] Retrying {state_spec.state} "
-                    f"({attempt + 1}/{max_retries})..."
-                )
-                time.sleep(RETRY_WAIT_SECONDS * attempt)
-
-    return False, 0, last_error
+            if item.is_visible():
+                return item
+        except Exception:
+            pass
+    return None
 
 
-def run_single_scheme_job(
-    driver,
-    spec: FilterSpec,
-    drill_to_district: bool = False,
-    csv_path: Optional[str] = None,
-    max_retries: int = MAX_STATE_RETRIES,
-):
-    if not drill_to_district:
-        output_path = csv_path or build_csv_filename(spec)
-
-        if spec.state:
-            success, row_count, error = download_state_with_retry(
-                driver, spec, output_path, max_retries
-            )
-            if not success:
-                raise RuntimeError(
-                    f"Could not download {spec.state} after all retries: {error}"
-                )
-            print(
-                f"  [{spec.scheme}] Saved {spec.state}: "
-                f"{row_count} district rows -> {output_path}"
-            )
-            return
-
-        navigate_to(driver, spec)
-        headers, rows = extract_table_rows(driver)
-        headers, rows = drop_grand_total(headers, rows)
-        append_rows(spec, headers, rows, output_path)
-        print(f"  [{spec.scheme}] Saved {len(rows)} state-summary rows -> {output_path}")
-        return
-
-    base_spec = FilterSpec(spec.year, spec.season, spec.scheme, None)
-    navigate_to(driver, base_spec)
-    states = row_names(driver)
-    print(f"[{spec.scheme}] Found {len(states)} states")
-
-    incomplete: List[Tuple[str, str]] = []
-    for state in states:
-        state_spec = FilterSpec(spec.year, spec.season, spec.scheme, state)
-        output_path = csv_path or build_csv_filename(state_spec)
-        success, row_count, error = download_state_with_retry(
-            driver, state_spec, output_path, max_retries
-        )
-        if success:
-            print(
-                f"  [{spec.scheme}] Saved {state}: "
-                f"{row_count} district rows -> {output_path}"
-            )
-        else:
-            incomplete.append((state, error))
-
-    if incomplete:
-        print(f"[{spec.scheme}] Rechecking {len(incomplete)} incomplete state(s)...")
-        unresolved: List[Tuple[str, str]] = []
-
-        for state, _ in incomplete:
-            state_spec = FilterSpec(spec.year, spec.season, spec.scheme, state)
-            output_path = csv_path or build_csv_filename(state_spec)
-            success, row_count, error = download_state_with_retry(
-                driver, state_spec, output_path, max_retries
-            )
-            if success:
-                print(
-                    f"  [{spec.scheme}] Saved {state}: "
-                    f"{row_count} district rows -> {output_path}"
-                )
-            else:
-                unresolved.append((state, error))
-
-        if unresolved:
-            details = "; ".join(f"{state} ({error})" for state, error in unresolved)
-            raise RuntimeError(f"Download incomplete after all retries: {details}")
-
-    print(f"[{spec.scheme}] Completed all {len(states)} states successfully.")
-
-
-def normalize_schemes(raw_scheme: str) -> List[str]:
-    """Normalize a single-scheme or combined-scheme command-line value."""
-    value = raw_scheme.strip().upper().replace(" ", "")
-
-    both_values = {
-        "BOTH",
-        "ALL",
-        "PMFBY&WBCIS",
-        "WBCIS&PMFBY",
-        "PMFBY+WBCIS",
-        "WBCIS+PMFBY",
-    }
-
-    if value in both_values:
-        return ["PMFBY", "WBCIS"]
-
-    if value in SCHEME_CODES:
-        return [value]
-
-    raise argparse.ArgumentTypeError(
-        "--scheme must be PMFBY, WBCIS, BOTH, PMFBY&WBCIS, or PMFBY+WBCIS"
-    )
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Download PMFBY dashboard state/district statistics"
-    )
-    parser.add_argument("--year", default="2026", help="Default: 2026")
-    parser.add_argument(
-        "--season",
-        default="Kharif",
-        choices=["Kharif", "Rabi"],
-        help="Default: Kharif",
-    )
-    parser.add_argument(
-        "--scheme",
-        default="BOTH",
-        help="PMFBY, WBCIS, BOTH, or PMFBY&WBCIS. Default: BOTH",
-    )
-    parser.add_argument(
-        "--state",
-        default=None,
-        help='Example: "MAHARASHTRA". If omitted, all states are downloaded.',
-    )
-    parser.add_argument(
-        "--drill-to-district",
-        action="store_true",
-        help="Download district data for all available states.",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="CSV filename/path. A bare filename is saved in the data folder.",
-    )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=MAX_STATE_RETRIES,
-        help=f"Retries per state in each pass. Default: {MAX_STATE_RETRIES}",
-    )
-    parser.add_argument(
-        "--headed", action="store_true", help="Run with visible Chrome window."
-    )
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    schemes = normalize_schemes(args.scheme)
-    max_retries = max(1, min(args.retries, 10))
-
-    # No state supplied means all available states at district level.
-    if args.state is None:
-        args.drill_to_district = True
-
-    if args.drill_to_district and args.state:
-        print("Note: --state is ignored because --drill-to-district was supplied.")
-        args.state = None
-
-    output_path = resolve_output_path(
-        args.output, args.year, args.season, args.scheme.upper()
-    )
-
-    print("=" * 65)
-    print("PMFBY DASHBOARD DATA DOWNLOADER")
-    print("=" * 65)
-    print(f"Year       : {args.year}")
-    print(f"Season     : {args.season}")
-    print(f"Scheme     : {args.scheme.upper()}")
-    print(f"State      : {args.state or 'ALL AVAILABLE STATES'}")
-    print(f"Level      : {'DISTRICT' if args.drill_to_district else 'STATE'}")
-    print(f"Output     : {output_path}")
-    print(f"Retries    : {max_retries}")
-    print("=" * 65)
-
-    driver = make_driver(headless=not args.headed)
+def click(locator: Locator) -> None:
+    locator.scroll_into_view_if_needed(timeout=5000)
     try:
-        for scheme in schemes:
-            print(f"\nStarting scheme: {scheme}")
-            spec = FilterSpec(
-                year=args.year,
-                season=args.season,
-                scheme=scheme,
-                state=None if args.drill_to_district else args.state,
-            )
-            # Pass retry count directly by temporarily using the validated default.
-            run_single_scheme_job(
-                driver,
-                spec,
-                drill_to_district=args.drill_to_district,
-                csv_path=output_path,
-                max_retries=max_retries,
-            )
-    finally:
-        driver.quit()
+        locator.click(timeout=10000)
+    except Exception:
+        locator.click(timeout=10000, force=True)
 
-    print("\n" + "=" * 65)
-    print("DOWNLOAD COMPLETED")
-    print("=" * 65)
-    print(f"CSV saved to:\n{output_path}")
-    print("=" * 65)
+
+def wait_stable(page: Page) -> None:
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        pass
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except PlaywrightTimeoutError:
+        pass
+
+
+def handle_captcha(page: Page) -> None:
+    text = clean_text(page.locator("body").inner_text()).lower()
+    if any(term in text for term in ("captcha", "recaptcha", "verify you are human")):
+        if HEADLESS:
+            raise RuntimeError("Human verification detected. Run with HEADLESS=False.")
+        input("Complete human verification in the browser, then press Enter: ")
+
+
+def click_text(page: Page, names: list[str], timeout_ms: int = 20000) -> None:
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        for name in names:
+            pattern = re.compile(re.escape(name), re.I)
+            for loc in (page.get_by_role("button", name=pattern), page.get_by_role("link", name=pattern), page.locator("button", has_text=pattern), page.locator("a", has_text=pattern)):
+                item = first_visible(loc)
+                if item:
+                    click(item)
+                    return
+        page.wait_for_timeout(400)
+    raise RuntimeError(f"Could not click: {names}")
+
+
+def find_field(page: Page, labels: list[str]) -> Locator:
+    controls = "select, input, [role='combobox'], mat-select, .ng-select, .p-dropdown"
+    for label in labels:
+        pattern = re.compile(re.escape(label), re.I)
+        item = first_visible(page.get_by_label(pattern, exact=False))
+        if item:
+            return item
+        item = first_visible(page.get_by_role("combobox", name=pattern))
+        if item:
+            return item
+        for index in range(page.locator(controls).count()):
+            field = page.locator(controls).nth(index)
+            try:
+                if not field.is_visible():
+                    continue
+            except Exception:
+                continue
+            attrs = " ".join(clean_text(field.get_attribute(a)) for a in ("placeholder", "aria-label", "title", "name"))
+            if pattern.search(attrs):
+                return field
+        labels_found = page.locator("label, mat-label, .form-label, .control-label").filter(has_text=pattern)
+        for index in range(labels_found.count()):
+            lab = labels_found.nth(index)
+            for xpath in ("following::select[1]", "following::input[1]", "following::*[@role='combobox'][1]", "following::mat-select[1]", "following::*[contains(@class,'ng-select')][1]"):
+                item = first_visible(lab.locator(f"xpath={xpath}"))
+                if item:
+                    return item
+    raise RuntimeError(f"Field not found: {labels}")
+
+
+def wait_enabled(field: Locator) -> None:
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        disabled = False
+        try:
+            disabled = field.is_disabled()
+        except Exception:
+            pass
+        if not disabled and clean_text(field.get_attribute("aria-disabled")).lower() != "true":
+            return
+        time.sleep(0.3)
+    raise RuntimeError("Field remained disabled")
+
+
+def valid_option(text: str) -> bool:
+    key = normalize(text)
+    return bool(key) and key not in {"select", "select one", "please select", "choose", "all", "none", "no data", "no options"} and not key.startswith("select ")
+
+
+def select_value(page: Page, labels: list[str], value: str) -> None:
+    field = find_field(page, labels)
+    wait_enabled(field)
+    tag = clean_text(field.evaluate("e => e.tagName")).lower()
+    if tag == "select":
+        try:
+            field.select_option(label=value)
+            page.wait_for_timeout(500)
+            return
+        except Exception:
+            pass
+        for index in range(field.locator("option").count()):
+            option = field.locator("option").nth(index)
+            if clean_text(option.inner_text()).casefold() == clean_text(value).casefold():
+                option_value = option.get_attribute("value")
+                if option_value is not None:
+                    field.select_option(value=option_value)
+                else:
+                    field.select_option(index=index)
+                page.wait_for_timeout(500)
+                return
+        raise RuntimeError(f"Option not found: {value}")
+    click(field)
+    page.wait_for_timeout(400)
+    pattern = re.compile(rf"^\s*{re.escape(clean_text(value))}\s*$", re.I)
+    for selector in ("[role='option']", "mat-option", ".ng-option", ".p-dropdown-item", ".dropdown-item", "ul[role='listbox'] li"):
+        item = first_visible(page.locator(selector).filter(has_text=pattern))
+        if item:
+            click(item)
+            page.wait_for_timeout(500)
+            return
+    page.keyboard.type(value, delay=30)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(500)
+
+
+def dropdown_options(page: Page, labels: list[str]) -> list[str]:
+    field = find_field(page, labels)
+    wait_enabled(field)
+    tag = clean_text(field.evaluate("e => e.tagName")).lower()
+    values: list[str] = []
+    if tag == "select":
+        for index in range(field.locator("option").count()):
+            text = clean_text(field.locator("option").nth(index).inner_text())
+            if valid_option(text):
+                values.append(text)
+    else:
+        click(field)
+        page.wait_for_timeout(500)
+        for selector in ("[role='listbox'] [role='option']", "mat-option", ".ng-option", ".p-dropdown-item", ".dropdown-item", "ul[role='listbox'] li"):
+            found = []
+            for index in range(page.locator(selector).count()):
+                option = page.locator(selector).nth(index)
+                try:
+                    if option.is_visible():
+                        text = clean_text(option.inner_text())
+                        if valid_option(text):
+                            found.append(text)
+                except Exception:
+                    pass
+            if found:
+                values = found
+                break
+        page.keyboard.press("Escape")
+    return list(dict.fromkeys(values))
+
+
+def fill_area(page: Page) -> None:
+    field = find_field(page, ["Area (In Hectare)", "Area In Hectare", "Area"])
+    wait_enabled(field)
+    field.fill(AREA_HECTARE)
+    field.evaluate("e => {e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true})); e.blur();}")
+
+
+def open_calculator(page: Page) -> None:
+    page.goto(HOME_URL, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
+    wait_stable(page)
+    handle_captcha(page)
+    click_text(page, ["Calculate Now"], 30000)
+    wait_stable(page)
+    handle_captcha(page)
+    find_field(page, ["Season"])
+
+
+def apply_base(page: Page) -> None:
+    select_value(page, ["Season"], SEASON)
+    select_value(page, ["Year"], YEAR)
+    select_value(page, ["Scheme"], SCHEME)
+    select_value(page, ["State"], STATE)
+    page.wait_for_timeout(1000)
+
+
+def table_rows(table: Locator) -> list[list[str]]:
+    rows = []
+    for r in range(table.locator("tr").count()):
+        cells = table.locator("tr").nth(r).locator("th, td")
+        values = [clean_text(cells.nth(c).inner_text()) for c in range(cells.count())]
+        if any(values):
+            rows.append(values)
+    return rows
+
+
+def all_tables(page: Page) -> list[list[list[str]]]:
+    result = []
+    for index in range(page.locator("table").count()):
+        table = page.locator("table").nth(index)
+        try:
+            if table.is_visible():
+                result.append(table_rows(table))
+        except Exception:
+            pass
+    return result
+
+
+def find_record(tables: list[list[list[str]]], required: list[str]) -> dict[str, str]:
+    required_norm = [normalize(x) for x in required]
+    for rows in tables:
+        for h in range(max(0, len(rows) - 1)):
+            headers = rows[h]
+            joined = " | ".join(normalize(x) for x in headers)
+            if all(term in joined for term in required_norm):
+                for d in range(h + 1, len(rows)):
+                    if any(rows[d]):
+                        return {normalize(header): clean_text(rows[d][i]) if i < len(rows[d]) else "" for i, header in enumerate(headers)}
+    return {}
+
+
+def value(record: dict[str, str], candidates: list[str]) -> str:
+    for candidate in map(normalize, candidates):
+        if candidate in record:
+            return clean_text(record[candidate])
+    for key, val in record.items():
+        if any(candidate in key or key in candidate for candidate in map(normalize, candidates)):
+            return clean_text(val)
+    return ""
+
+
+def wait_results(page: Page) -> None:
+    deadline = time.time() + RESULT_TIMEOUT_MS / 1000
+    while time.time() < deadline:
+        handle_captcha(page)
+        text = clean_text(page.locator("body").inner_text()).lower()
+        if sum(term in text for term in ("insurance company", "premium paid by farmer", "sum insured")) >= 2:
+            page.wait_for_timeout(800)
+            return
+        if any(term in text for term in ("no data found", "no record found", "something went wrong", "service unavailable")):
+            raise RuntimeError("Portal returned no data or an error")
+        page.wait_for_timeout(600)
+    raise RuntimeError("Premium result timeout")
+
+
+def extract_result(page: Page, district: str, crop: str) -> dict:
+    tables = all_tables(page)
+    insurance = find_record(tables, ["insurance company", "sum insured", "farmer share"])
+    premium = find_record(tables, ["crop", "area", "premium paid by farmer"])
+    dates = find_record(tables, ["cut off date", "data entry date"])
+    row = {
+        "season": SEASON, "year": YEAR, "scheme": SCHEME, "state": STATE, "district": district,
+        "crop": value(premium, ["Crop"]) or crop,
+        "area_hectare": value(premium, ["Area(Hectare)", "Area Hectare", "Area"]) or AREA_HECTARE,
+        "insurance_company": value(insurance, ["Insurance Company"]),
+        "sum_insured_rs_per_hectare": value(insurance, ["Sum Insured (Rs)/Hectare", "Sum Insured Per Hectare"]),
+        "farmer_share_percent": value(insurance, ["Farmer Share (%)", "Farmer Share"]),
+        "actuarial_rate_percent": value(insurance, ["Acturial Rate (%)", "Actuarial Rate (%)"]),
+        "cutoff_date_actual": value(insurance, ["Cut-off (Actual)", "Cut Off Actual"]),
+        "premium_paid_by_farmer_rs": value(premium, ["Premium Paid By Farmer (Rs)", "Premium Paid By Farmer"]),
+        "premium_paid_by_government_rs": value(premium, ["Premium Paid By Govt (Rs)", "Premium Paid By Government (Rs)"]),
+        "sum_insured_rs": value(premium, ["Sum Insured (Rs)", "Sum Insured Rs"]),
+        "cutoff_date_csc": value(dates, ["Cut Off Date (CSC)", "Cut-Off Date CSC"]),
+        "cutoff_date_aide": value(dates, ["Cut Off Date (AIDE)", "Cut-Off Date AIDE"]),
+        "data_entry_date_bank": value(dates, ["Data Entry Date (Bank)", "Data Entry Date Bank"]),
+        "premium_debit_date_bank": value(dates, ["Premim Debit Date (Bank)", "Premium Debit Date (Bank)"]),
+        "challan_date_bank": value(dates, ["Challan Date (Bank)", "Challan Date Bank"]),
+        "scraped_at": timestamp(), "status": "success", "remarks": ""
+    }
+    if not any(row[k] for k in ("insurance_company", "sum_insured_rs_per_hectare", "premium_paid_by_farmer_rs", "sum_insured_rs")):
+        raise RuntimeError("Result appeared, but premium fields could not be extracted")
+    return row
+
+
+def reset(page: Page) -> None:
+    try:
+        find_field(page, ["Season"])
+        return
+    except Exception:
+        pass
+    for name in ("Close", "Back", "OK"):
+        item = first_visible(page.get_by_role("button", name=re.compile(rf"^{name}$", re.I)))
+        if item:
+            click(item)
+            page.wait_for_timeout(400)
+            return
+    open_calculator(page)
+
+
+def scrape(page: Page) -> None:
+    done = completed_pairs()
+    apply_base(page)
+    districts = dropdown_options(page, ["District"])
+    if not districts:
+        raise RuntimeError("No Goa districts found")
+    for district in districts:
+        reset(page)
+        apply_base(page)
+        select_value(page, ["District"], district)
+        page.wait_for_timeout(900)
+        crops = dropdown_options(page, ["Crop"])
+        print(f"{district}: {len(crops)} crops")
+        for crop in crops:
+            key = (district.casefold(), crop.casefold())
+            if key in done:
+                print(f"  SKIP {crop}")
+                continue
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                try:
+                    reset(page)
+                    apply_base(page)
+                    select_value(page, ["District"], district)
+                    page.wait_for_timeout(800)
+                    select_value(page, ["Crop"], crop)
+                    fill_area(page)
+                    click_text(page, ["Check Premium", "Calculate Premium"])
+                    wait_results(page)
+                    row = extract_result(page, district, crop)
+                    append_csv(OUTPUT_CSV, row, OUTPUT_COLUMNS)
+                    done.add(key)
+                    print(f"  SAVED {crop}: farmer={row['premium_paid_by_farmer_rs']}")
+                    break
+                except Exception as exc:
+                    append_csv(FAILURE_CSV, {"season": SEASON, "year": YEAR, "scheme": SCHEME, "state": STATE, "district": district, "crop": crop, "attempt": attempt, "error": clean_text(str(exc)), "failed_at": timestamp()}, FAILURE_COLUMNS)
+                    print(f"  Attempt {attempt} failed for {crop}: {exc}")
+                    if attempt < MAX_ATTEMPTS:
+                        open_calculator(page)
+
+
+def main() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    browser: Optional[Browser] = None
+    context: Optional[BrowserContext] = None
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=HEADLESS, args=["--start-maximized"])
+            context = browser.new_context(viewport={"width": 1440, "height": 1000}, locale="en-IN", timezone_id="Asia/Kolkata")
+            context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+            context.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
+            page = context.new_page()
+            open_calculator(page)
+            scrape(page)
+            print(f"Completed. CSV: {OUTPUT_CSV.resolve()}")
+    except KeyboardInterrupt:
+        print("Stopped. Completed rows remain in the CSV.")
+    except Exception as exc:
+        print(f"Fatal error: {exc}")
+        traceback.print_exc()
+    finally:
+        if context:
+            context.close()
+        if browser:
+            browser.close()
 
 
 if __name__ == "__main__":
